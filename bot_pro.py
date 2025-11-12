@@ -1,4 +1,3 @@
-
 import ccxt
 import pandas as pd
 import asyncio
@@ -18,6 +17,7 @@ TON_API = "https://toncenter.com/api/v2"
 exchange = ccxt.binance({'enableRateLimit': True})
 users = {}
 SYMBOLS = []
+last_signals = []  # لیست آخرین سیگنال‌ها
 
 # --- ۲۴ ساعته با Flask ---
 app = Flask('')
@@ -50,7 +50,7 @@ def check_payment(user_id):
     except:
         return False
 
-# --- تولید سیگنال ---
+# --- تولید سیگنال (هر دو سمت BUY و SELL) ---
 def generate_signal(symbol):
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, '15m', limit=50)
@@ -58,8 +58,12 @@ def generate_signal(symbol):
         df['ema9'] = df['close'].ewm(span=9).mean()
         df['ema21'] = df['close'].ewm(span=21).mean()
         last = df.iloc[-1]
-        if last['ema9'] > last['ema21'] and last['close'] > df['high'].iloc[-5:-1].max():
-            return f"BUY {symbol.split('/')[0]}\nPrice: ${last['close']:.2f}\nTarget: +8%"
+        prev_high = df['high'].iloc[-5:-1].max()
+        prev_low = df['low'].iloc[-5:-1].min()
+        if last['ema9'] > last['ema21'] and last['close'] > prev_high:
+            return f"BUY {symbol.split('/')[0]}\nPrice: ${last['close']:.2f}\nTarget: +8% | SL: -4%"
+        elif last['ema9'] < last['ema21'] and last['close'] < prev_low:
+            return f"SELL {symbol.split('/')[0]}\nPrice: ${last['close']:.2f}\nTarget: -8% | SL: +4%"
         return None
     except:
         return None
@@ -84,17 +88,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text(f"Send 1 TON + ID `{query.from_user.id}` in comment")
+    await query.edit_message_text(f"Send 1 TON + ID `{query.from_user.id}` in comment\nTo find your Comment, in Tonkeeper app, go to Send TON section and enter your Telegram ID in the 'Comment' field.")
 
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     active = sum(1 for u in users.values() if u['paid'] and datetime.now() < u['expires'])
-    await update.message.reply_text(f"**Admin Panel**\nActive Users: {active}\nWin Rate: 85%")
+    signals_msg = "**Last Signals:**\n\n" + "\n\n".join(last_signals[:5]) if last_signals else "No signals yet."
+    await update.message.reply_text(f"**Admin Panel**\nActive Users: {active}\nWin Rate: 85%\n{signals_msg}", parse_mode='Markdown')
 
 # --- اسکن سیگنال ---
 async def scan_signals(app):
-    global SYMBOLS
+    global SYMBOLS, last_signals
     if not SYMBOLS:
         markets = exchange.load_markets()
         SYMBOLS = [s for s in markets if s.endswith('/USDT')][:50]
@@ -105,6 +110,7 @@ async def scan_signals(app):
             signals.append(sig)
     if signals:
         msg = "**NEW SIGNALS (85% Win Rate)**\n\n" + "\n\n".join(signals[:3])
+        last_signals = signals  # ذخیره آخرین سیگنال‌ها برای ادمین
         for user_id, data in users.items():
             if data['paid'] and datetime.now() < data['expires']:
                 try:
