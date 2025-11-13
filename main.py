@@ -3,38 +3,36 @@ import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
 import json
+import aiohttp  # <-- برای ارتباط مستقیم با TON Center
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    PreCheckoutQuery
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes,
-    PreCheckoutQueryHandler
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes
 )
 from telegram.constants import ParseMode
 import aiomysql
-from ton import ToncenterClient
 
 # ====================== CONFIGURATION ======================
 BOT_TOKEN = "7123456789:AAHxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # از @BotFather
 TON_MASTER_WALLET = "UQC8oNGKujcu7QFJ5YDfMq7AO-IOqFO923YGAy0Ci75GBZSh"
 TON_API_KEY = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0"  # از toncenter.com
-TON_TESTNET = False
+TON_TESTNET = False  # فقط برای تست = True
 ADMIN_ID = 159895496
 VIP_CHANNEL_LINK = "https://t.me/+your_private_vip_channel_here"
 SUPPORT_USERNAME = "@hormuz1991_70"
 
-# دیتابیس (محلی یا سرور)
+# دیتابیس محلی (تغییر دهید اگر لازم است)
 DB_CONFIG = {
     'host': 'localhost',
-    'user': 'root',           # تغییر دهید
-    'password': '',           # رمز دیتابیس
+    'user': 'root',
+    'password': '',
     'db': 'crypto_signal_bot',
     'autocommit': True
 }
 
-# پلن‌ها
+# پلن‌های اشتراک
 PLANS = {
     "1": {"months": 1, "ton": Decimal("1.0"), "label": "1 Month - 1 TON"},
     "3": {"months": 3, "ton": Decimal("2.0"), "label": "3 Months - 2 TON"},
@@ -43,9 +41,6 @@ PLANS = {
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# TON Client
-ton_client = ToncenterClient(api_key=TON_API_KEY, testnet=TON_TESTNET)
 # ==========================================================
 
 # === DATABASE HELPERS ===
@@ -78,23 +73,43 @@ async def update_user(user_id, **kwargs):
         await cur.execute(f"UPDATE users SET {set_clause} WHERE user_id = %s", values)
     conn.close()
 
-# === TON PAYMENT CHECKER ===
+# === TON API DIRECT (بدون پکیج خارجی) ===
+async def get_ton_transactions(wallet_address: str, limit: int = 20):
+    url = "https://toncenter.com/api/v2/getTransactions"
+    params = {
+        "address": wallet_address,
+        "limit": limit,
+        "api_key": TON_API_KEY
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=10) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+                return data.get("result", [])
+    except Exception as e:
+        logger.error(f"TON API Error: {e}")
+        return []
+
 async def check_ton_payment(expected_amount: Decimal, user_id: int):
     try:
-        transactions = await ton_client.get_transactions(TON_MASTER_WALLET, limit=10)
+        transactions = await get_ton_transactions(TON_MASTER_WALLET)
         for tx in transactions:
-            if 'in_msg' not in tx or 'value' not in tx['in_msg']:
+            in_msg = tx.get("in_msg", {})
+            value_nano = in_msg.get("value", "0")
+            if not value_nano.isdigit():
                 continue
-            value = Decimal(tx['in_msg']['value']) / Decimal(1_000_000_000)
-            if value >= expected_amount and tx['in_msg'].get('destination') == TON_MASTER_WALLET:
-                # ثبت پرداخت
+            value = Decimal(value_nano) / Decimal(1_000_000_000)
+            destination = in_msg.get("destination", "")
+            if value >= expected_amount and destination == TON_MASTER_WALLET:
                 conn = await get_db()
                 async with conn.cursor() as cur:
                     await cur.execute("""
                         INSERT INTO payments (user_id, tx_hash, amount, plan_months, status)
                         VALUES (%s, %s, %s, %s, 'confirmed')
                         ON DUPLICATE KEY UPDATE status='confirmed'
-                    """, (user_id, tx['hash'], float(value), 1))
+                    """, (user_id, tx.get("hash", ""), float(value), 1))
                 conn.close()
                 return True
         return False
@@ -116,9 +131,12 @@ def account_menu(user):
         [InlineKeyboardButton("Buy/Renew VIP Access", callback_data="buy")]
     ]
     if user['membership'] == 'vip' and user['vip_expiry']:
-        expiry = datetime.fromisoformat(user['vip_expiry'].replace('Z', '+00:00'))
-        if expiry > datetime.utcnow():
-            buttons.append([InlineKeyboardButton("VIP Channel Link", callback_data="vip_link")])
+        try:
+            expiry = datetime.fromisoformat(user['vip_expiry'].replace('Z', '+00:00'))
+            if expiry > datetime.utcnow():
+                buttons.append([InlineKeyboardButton("VIP Channel Link", callback_data="vip_link")])
+        except:
+            pass
     buttons.append([InlineKeyboardButton("Back", callback_data="back")])
     return InlineKeyboardMarkup(buttons)
 
@@ -154,8 +172,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "status":
         expiry = user['vip_expiry']
         if user['membership'] == 'vip' and expiry:
-            days_left = (datetime.fromisoformat(expiry.replace('Z', '+00:00')) - datetime.utcnow()).days
-            status = f"VIP Active • Expires in {days_left} days"
+            try:
+                days_left = (datetime.fromisoformat(expiry.replace('Z', '+00:00')) - datetime.utcnow()).days
+                status = f"VIP Active • Expires in {days_left} days"
+            except:
+                status = "VIP (Error in date)"
         else:
             status = "Free / Trial"
         text = (
@@ -216,41 +237,51 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # === PAYMENT WATCHER ===
 async def payment_watcher(application: Application):
     while True:
-        conn = await get_db()
-        async with conn.cursor(dictionary=True) as cur:
-            await cur.execute("""
-                SELECT DISTINCT user_id FROM payments 
-                WHERE status = 'pending' AND created_at > NOW() - INTERVAL 10 MINUTE
-            """)
-            pending_users = await cur.fetchall()
-        conn.close()
-
-        for row in pending_users:
-            user_id = row['user_id']
-            user = await get_user(user_id)
-            if user['membership'] == 'vip':
-                continue
-            # فرض: آخرین پلن در دیتابیس
+        try:
             conn = await get_db()
             async with conn.cursor(dictionary=True) as cur:
-                await cur.execute("SELECT amount, plan_months FROM payments WHERE user_id=%s ORDER BY id DESC LIMIT 1", (user_id,))
-                pay = await cur.fetchone()
+                await cur.execute("""
+                    SELECT DISTINCT user_id FROM payments 
+                    WHERE status = 'pending' AND created_at > NOW() - INTERVAL 10 MINUTE
+                """)
+                pending_users = await cur.fetchall()
             conn.close()
-            if not pay:
-                continue
-            confirmed = await check_ton_payment(Decimal(pay['amount']), user_id)
-            if confirmed:
-                months = pay['plan_months']
-                expiry = datetime.utcnow() + timedelta(days=30 * months)
-                await update_user(user_id, membership='vip', vip_expiry=expiry.isoformat())
-                try:
-                    await application.bot.send_message(
-                        user_id,
-                        f"*VIP Activated!*\nPlan: {months} month(s)\nExpires: {expiry.strftime('%Y-%m-%d')}\n\n{VIP_CHANNEL_LINK}",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                except:
-                    pass
+
+            for row in pending_users:
+                user_id = row['user_id']
+                user = await get_user(user_id)
+                if user['membership'] == 'vip':
+                    continue
+
+                # آخرین پرداخت کاربر
+                conn = await get_db()
+                async with conn.cursor(dictionary=True) as cur:
+                    await cur.execute("""
+                        SELECT amount, plan_months FROM payments 
+                        WHERE user_id=%s AND status='pending' 
+                        ORDER BY id DESC LIMIT 1
+                    """, (user_id,))
+                    pay = await cur.fetchone()
+                conn.close()
+
+                if not pay:
+                    continue
+
+                confirmed = await check_ton_payment(Decimal(pay['amount']), user_id)
+                if confirmed:
+                    months = pay['plan_months']
+                    expiry = datetime.utcnow() + timedelta(days=30 * months)
+                    await update_user(user_id, membership='vip', vip_expiry=expiry.isoformat())
+                    try:
+                        await application.bot.send_message(
+                            user_id,
+                            f"*VIP Activated!*\nPlan: {months} month(s)\nExpires: {expiry.strftime('%Y-%m-%d')}\n\n{VIP_CHANNEL_LINK}",
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                    except:
+                        pass
+        except Exception as e:
+            logger.error(f"Payment watcher error: {e}")
         await asyncio.sleep(30)
 
 # === MAIN ===
@@ -260,11 +291,11 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(PreCheckoutQueryHandler(lambda u, c: True))
 
+    # شروع بررسی پرداخت‌ها
     app.job_queue.run_repeating(payment_watcher, interval=30, first=10)
 
-    print("Crypto Signal Bot is running...")
+    print("Crypto Signal Bot is running... (Press Ctrl+C to stop)")
     app.run_polling()
 
 if __name__ == "__main__":
